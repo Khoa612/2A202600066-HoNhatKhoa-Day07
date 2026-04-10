@@ -47,8 +47,20 @@ class SentenceChunker:
         self.max_sentences_per_chunk = max(1, max_sentences_per_chunk)
 
     def chunk(self, text: str) -> list[str]:
-        # TODO: split into sentences, group into chunks
-        raise NotImplementedError("Implement SentenceChunker.chunk")
+        if not text:
+            return []
+        # Split on sentence boundaries: ". ", "! ", "? ", or ".\n"
+        sentences = re.split(r'(?<=[.!?]) |(?<=\.)\n', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        if not sentences:
+            return [text.strip()] if text.strip() else []
+
+        chunks = []
+        for i in range(0, len(sentences), self.max_sentences_per_chunk):
+            chunk = " ".join(sentences[i : i + self.max_sentences_per_chunk])
+            chunks.append(chunk)
+        return chunks
 
 
 class RecursiveChunker:
@@ -66,12 +78,63 @@ class RecursiveChunker:
         self.chunk_size = chunk_size
 
     def chunk(self, text: str) -> list[str]:
-        # TODO: implement recursive splitting strategy
-        raise NotImplementedError("Implement RecursiveChunker.chunk")
+        if not text:
+            return []
+        return self._split(text, self.separators)
 
     def _split(self, current_text: str, remaining_separators: list[str]) -> list[str]:
-        # TODO: recursive helper used by RecursiveChunker.chunk
-        raise NotImplementedError("Implement RecursiveChunker._split")
+        # Base case: text already fits
+        if len(current_text) <= self.chunk_size:
+            return [current_text]
+
+        # No separators left — hard-split by chunk_size
+        if not remaining_separators:
+            return [
+                current_text[i : i + self.chunk_size]
+                for i in range(0, len(current_text), self.chunk_size)
+            ]
+
+        sep = remaining_separators[0]
+        next_seps = remaining_separators[1:]
+
+        # Character-level fallback for empty-string separator
+        if sep == "":
+            return [
+                current_text[i : i + self.chunk_size]
+                for i in range(0, len(current_text), self.chunk_size)
+            ]
+
+        pieces = current_text.split(sep)
+
+        # Separator not found in text — try next separator
+        if len(pieces) <= 1:
+            return self._split(current_text, next_seps)
+
+        # Merge small pieces back together, recurse on oversized ones
+        result: list[str] = []
+        current_chunk = pieces[0]
+
+        for piece in pieces[1:]:
+            candidate = current_chunk + sep + piece
+            if len(candidate) <= self.chunk_size:
+                current_chunk = candidate
+            else:
+                # Flush current_chunk
+                if current_chunk:
+                    if len(current_chunk) <= self.chunk_size:
+                        result.append(current_chunk)
+                    else:
+                        result.extend(self._split(current_chunk, next_seps))
+                current_chunk = piece
+
+        # Flush remaining
+        if current_chunk:
+            if len(current_chunk) <= self.chunk_size:
+                result.append(current_chunk)
+            else:
+                result.extend(self._split(current_chunk, next_seps))
+
+        return result
 
 
 def _dot(a: list[float], b: list[float]) -> float:
@@ -86,13 +149,130 @@ def compute_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 
     Returns 0.0 if either vector has zero magnitude.
     """
-    # TODO: implement cosine similarity formula
-    raise NotImplementedError("Implement compute_similarity")
+    dot_product = _dot(vec_a, vec_b)
+    mag_a = math.sqrt(_dot(vec_a, vec_a))
+    mag_b = math.sqrt(_dot(vec_b, vec_b))
+
+    if mag_a == 0.0 or mag_b == 0.0:
+        return 0.0
+
+    return dot_product / (mag_a * mag_b)
+
+
+class SemanticChunker:
+    """
+    Split text into chunks based on semantic similarity between sentences.
+
+    Algorithm:
+        1. Split text into individual sentences.
+        2. Embed each sentence using the provided embedding function.
+        3. Compute cosine similarity between sentence[i] and sentence[i+1].
+        4. Start a new chunk when EITHER condition is met:
+             a) similarity < threshold  → semantic topic shift detected.
+             b) current chunk length >= max_chunk_size → hard size limit hit.
+        5. min_sentences prevents tiny 1-sentence chunks (unless step 4b fires).
+
+    Args:
+        embedding_fn:   Callable(str) -> list[float].
+        threshold:      Cosine similarity below this value triggers a semantic split.
+                        Typical range: 0.3–0.8 (lower = more aggressive splitting).
+        min_sentences:  Minimum sentences to accumulate before a semantic split is allowed.
+        max_chunk_size: Hard character limit per chunk.  When the accumulated chunk
+                        exceeds this size the chunk is flushed regardless of similarity.
+                        Prevents runaway chunks on long, topic-consistent documents.
+                        Default: 1000 characters.
+    """
+
+    def __init__(
+        self,
+        embedding_fn: "callable[[str], list[float]]",
+        threshold: float = 0.8,
+        min_sentences: int = 2,
+        max_chunk_size: int = 1000,
+    ) -> None:
+        self.embedding_fn = embedding_fn
+        self.threshold = threshold
+        self.min_sentences = max(1, min_sentences)
+        self.max_chunk_size = max_chunk_size
+
+    def chunk(self, text: str) -> list[str]:
+        if not text.strip():
+            return []
+
+        # Step 1: Split into sentences
+        sentences = re.split(r'(?<=[.!?]) |(?<=\.)\n', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        if len(sentences) <= self.min_sentences:
+            return [text.strip()] if text.strip() else []
+
+        # Step 2: Embed every sentence
+        # Prefer batch embedding (1 API call) over sequential (N API calls).
+        # embed_batch() is available on MockEmbedder, LocalEmbedder, OpenAIEmbedder.
+        if hasattr(self.embedding_fn, "embed_batch"):
+            embeddings = self.embedding_fn.embed_batch(sentences)
+        else:
+            # Fallback for plain callables (e.g. lambda functions in tests)
+            embeddings = [self.embedding_fn(s) for s in sentences]
+
+        # Step 3: Compute pairwise cosine similarities between consecutive sentences
+        similarities: list[float] = []
+        for i in range(len(sentences) - 1):
+            sim = compute_similarity(embeddings[i], embeddings[i + 1])
+            similarities.append(sim)
+
+        # Step 4 & 5: Group sentences into chunks
+        chunks: list[str] = []
+        current_group: list[str] = [sentences[0]]
+
+        for i, sim in enumerate(similarities):
+            next_sentence = sentences[i + 1]
+            current_text = " ".join(current_group)
+            current_size = len(current_text)
+
+            # Condition A: semantic topic shift
+            semantic_split = (
+                sim < self.threshold
+                and len(current_group) >= self.min_sentences
+            )
+
+            # Condition B: hard size limit — flush regardless of similarity
+            size_split = (
+                current_size + len(next_sentence) + 1 > self.max_chunk_size
+                and len(current_group) >= 1
+            )
+
+            if semantic_split or size_split:
+                chunks.append(current_text)
+                current_group = [next_sentence]
+            else:
+                current_group.append(next_sentence)
+
+        # Flush the last group
+        if current_group:
+            chunks.append(" ".join(current_group))
+
+        return chunks
 
 
 class ChunkingStrategyComparator:
     """Run all built-in chunking strategies and compare their results."""
 
     def compare(self, text: str, chunk_size: int = 200) -> dict:
-        # TODO: call each chunker, compute stats, return comparison dict
-        raise NotImplementedError("Implement ChunkingStrategyComparator.compare")
+        strategies = {
+            "fixed_size": FixedSizeChunker(chunk_size=chunk_size, overlap=0),
+            "by_sentences": SentenceChunker(max_sentences_per_chunk=3),
+            "recursive": RecursiveChunker(chunk_size=chunk_size),
+        }
+
+        result = {}
+        for name, chunker in strategies.items():
+            chunks = chunker.chunk(text)
+            count = len(chunks)
+            avg_length = sum(len(c) for c in chunks) / count if count > 0 else 0
+            result[name] = {
+                "count": count,
+                "avg_length": round(avg_length, 2),
+                "chunks": chunks,
+            }
+        return result
